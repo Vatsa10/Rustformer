@@ -1,135 +1,54 @@
-use nalgebra::DMatrix;
-use crate::config::TransformerConfig;
-use anyhow::Result;
+use candle_core::{Tensor, Device, Result};
+use candle_nn::{VarBuilder, Module, LayerNorm, Linear, layer_norm, linear};
+use crate::attention::{MultiHeadAttention, MaskedMultiHeadAttention, CrossMultiHeadAttention};
+use crate::model_args::ModelArgs;
 
-/// Scaled Dot-Product Attention implementation
-/// Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
-pub struct ScaledDotProductAttention {
-    d_k: usize,
-}
-
-impl ScaledDotProductAttention {
-    pub fn new(d_k: usize) -> Self {
-        Self { d_k }
-    }
-    
-    /// Apply scaled dot-product attention
-    /// q, k, v: matrices of shape (seq_len, d_k)
-    pub fn forward(&self, q: &DMatrix<f64>, k: &DMatrix<f64>, v: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        let scale = 1.0 / (self.d_k as f64).sqrt();
-        
-        // Compute attention scores: QK^T / sqrt(d_k)
-        let scores = q * k.transpose() * scale;
-        
-        // Apply softmax row-wise
-        let attention_weights = self.softmax(&scores);
-        
-        // Apply attention weights to values
-        let output = &attention_weights * v;
-        
-        Ok(output)
-    }
-    
-    fn softmax(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
-        let mut result = x.clone();
-        for mut row in result.row_iter_mut() {
-            // Find max for numerical stability
-            let max_val = row.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            
-            // Subtract max and exponentiate
-            for val in row.iter_mut() {
-                *val = (*val - max_val).exp();
-            }
-            
-            // Normalize
-            let sum: f64 = row.iter().sum();
-            for val in row.iter_mut() {
-                *val /= sum;
-            }
-        }
-        result
-    }
-}
-
-/// Multi-Head Attention implementation
-pub struct MultiHeadAttention {
-    num_heads: usize,
-    d_model: usize,
-    d_k: usize,
-    attention: ScaledDotProductAttention,
-    // In a full implementation, these would be actual weight matrices
-    // For this demo, we'll simulate them
-}
-
-impl MultiHeadAttention {
-    pub fn new(d_model: usize, num_heads: usize) -> Self {
-        let d_k = d_model / num_heads;
-        let attention = ScaledDotProductAttention::new(d_k);
-        
-        Self {
-            num_heads,
-            d_model,
-            d_k,
-            attention,
-        }
-    }
-    
-    pub fn forward(&self, query: &DMatrix<f64>, key: &DMatrix<f64>, value: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        let _seq_len = query.nrows();
-        
-        // In a full implementation, we would:
-        // 1. Apply linear projections W_Q, W_K, W_V
-        // 2. Split into multiple heads
-        // 3. Apply attention for each head
-        // 4. Concatenate heads
-        // 5. Apply output projection W_O
-        
-        // For this demo, we'll just apply single-head attention
-        self.attention.forward(query, key, value)
-    }
-}
-
-/// Position-wise Feed-Forward Network
-/// FFN(x) = max(0, xW1 + b1)W2 + b2
+// --- Position-wise Feed-Forward Network ---
 pub struct PositionwiseFeedForward {
-    d_model: usize,
-    d_ff: usize,
+    linear1: Linear,
+    linear2: Linear,
 }
 
 impl PositionwiseFeedForward {
-    pub fn new(d_model: usize, d_ff: usize) -> Self {
-        Self { d_model, d_ff }
+    pub fn new(d_model: usize, d_ff: usize, vb: VarBuilder) -> Result<Self> {
+        let linear1 = linear(d_model, d_ff, vb.pp("ffn_linear1"))?;
+        let linear2 = linear(d_ff, d_model, vb.pp("ffn_linear2"))?;
+        Ok(Self { linear1, linear2 })
     }
-    
-    pub fn forward(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
-        // In a full implementation, this would use actual weight matrices
-        // For demo purposes, we'll apply a simple transformation
-        x.map(|val| (val * 2.0).max(0.0)) // Simplified ReLU-like activation
+}
+impl Module for PositionwiseFeedForward {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.linear2.forward(&self.linear1.forward(x)?.relu()?)
     }
 }
 
-/// Layer Normalization
-pub struct LayerNorm;
+// --- Positional Encoding ---
+pub struct PositionalEncoding {
+    encoding: Tensor,
+}
 
-impl LayerNorm {
-    pub fn forward(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
-        let mut result = x.clone();
-        let eps = 1e-6;
-        
-        for mut row in result.row_iter_mut() {
-            let mean = row.iter().sum::<f64>() / row.len() as f64;
-            let variance = row.iter().map(|&val| (val - mean).powi(2)).sum::<f64>() / row.len() as f64;
-            let std = (variance + eps).sqrt();
-            
-            for val in row.iter_mut() {
-                *val = (*val - mean) / std;
+impl PositionalEncoding {
+    pub fn new(max_seq_len: usize, d_model: usize, device: &Device) -> Result<Self> {
+        let mut pe = Tensor::zeros((max_seq_len, d_model), candle_core::DType::F32, device)?;
+        for pos in 0..max_seq_len {
+            for i in (0..d_model).step_by(2) {
+                let div_term = (-(i as f32 / d_model as f32) * (10000.0_f32).ln()).exp();
+                let angle = pos as f32 * div_term;
+                pe = pe.slice_assign(&[pos..pos+1, i..i+1], &Tensor::from_slice(&[angle.sin()], (1,1), device)?)?;
+                if i + 1 < d_model {
+                    pe = pe.slice_assign(&[pos..pos+1, i+1..i+2], &Tensor::from_slice(&[angle.cos()], (1,1), device)?)?;
+                }
             }
         }
-        result
+        Ok(Self { encoding: pe })
+    }
+
+    pub fn forward(&self, seq_len: usize) -> Result<Tensor> {
+        self.encoding.narrow(0, 0, seq_len)
     }
 }
 
-/// Encoder Layer
+// --- Encoder Layer ---
 pub struct EncoderLayer {
     self_attention: MultiHeadAttention,
     ffn: PositionwiseFeedForward,
@@ -138,134 +57,145 @@ pub struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    pub fn new(d_model: usize, num_heads: usize, d_ff: usize) -> Self {
-        Self {
-            self_attention: MultiHeadAttention::new(d_model, num_heads),
-            ffn: PositionwiseFeedForward::new(d_model, d_ff),
-            norm1: LayerNorm,
-            norm2: LayerNorm,
-        }
+    pub fn new(args: &ModelArgs, vb: VarBuilder) -> Result<Self> {
+        let self_attention = MultiHeadAttention::new(args.embeddings_dims, args.no_of_heads, vb.pp("self_attn"))?;
+        let ffn = PositionwiseFeedForward::new(args.embeddings_dims, args.d_ff, vb.pp("ffn"))?;
+        let norm1 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln1"))?;
+        let norm2 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln2"))?;
+        Ok(Self { self_attention, ffn, norm1, norm2 })
     }
-    
-    pub fn forward(&self, x: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        // Self-attention with residual connection and layer norm
-        let attn_output = self.self_attention.forward(x, x, x)?;
-        let x = self.norm1.forward(&(x + attn_output));
-        
-        // Feed-forward with residual connection and layer norm
-        let ffn_output = self.ffn.forward(&x);
-        let x = self.norm2.forward(&(&x + ffn_output));
-        
+}
+impl Module for EncoderLayer {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let residual = x;
+        let x_attn = self.self_attention.forward(x)?;
+        let x = self.norm1.forward(&(x_attn + residual)?)?;
+
+        let residual = &x;
+        let x_ffn = self.ffn.forward(&x)?;
+        let x = self.norm2.forward(&(x_ffn + residual)?)?;
         Ok(x)
     }
 }
 
-/// Positional Encoding using sinusoidal functions
-pub struct PositionalEncoding {
-    encoding: DMatrix<f64>,
+// --- Encoder ---
+pub struct Encoder {
+    layers: Vec<EncoderLayer>,
 }
 
-impl PositionalEncoding {
-    pub fn new(max_seq_len: usize, d_model: usize) -> Self {
-        let mut encoding = DMatrix::zeros(max_seq_len, d_model);
-        
-        for pos in 0..max_seq_len {
-            for i in (0..d_model).step_by(2) {
-                let div_term = (i as f64 / d_model as f64) * (10000.0_f64).ln();
-                let div_term = (-div_term).exp();
-                let angle = pos as f64 * div_term;
-                
-                encoding[(pos, i)] = angle.sin();
-                if i + 1 < d_model {
-                    encoding[(pos, i + 1)] = angle.cos();
-                }
-            }
+impl Encoder {
+    pub fn new(args: &ModelArgs, vb: VarBuilder) -> Result<Self> {
+        let mut layers = Vec::new();
+        for i in 0..args.no_of_encoder_layers {
+            layers.push(EncoderLayer::new(args, vb.pp(&format!("layer_{}", i)))?);
         }
-        
-        Self { encoding }
-    }
-    
-    pub fn forward(&self, seq_len: usize) -> DMatrix<f64> {
-        self.encoding.rows(0, seq_len).into()
+        Ok(Self { layers })
     }
 }
 
-/// Complete Transformer model
+impl Module for Encoder {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x_out = x.clone();
+        for layer in &self.layers {
+            x_out = layer.forward(&x_out)?;
+        }
+        Ok(x_out)
+    }
+}
+
+// --- Decoder Layer ---
+pub struct DecoderLayer {
+    masked_self_attention: MaskedMultiHeadAttention,
+    cross_attention: CrossMultiHeadAttention,
+    ffn: PositionwiseFeedForward,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    norm3: LayerNorm,
+}
+
+impl DecoderLayer {
+    pub fn new(args: &ModelArgs, vb: VarBuilder) -> Result<Self> {
+        let masked_self_attention = MaskedMultiHeadAttention::new(args.embeddings_dims, args.no_of_heads, vb.pp("masked_self_attn"))?;
+        let cross_attention = CrossMultiHeadAttention::new(args.embeddings_dims, args.no_of_heads, vb.pp("cross_attn"))?;
+        let ffn = PositionwiseFeedForward::new(args.embeddings_dims, args.d_ff, vb.pp("ffn"))?;
+        let norm1 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln1"))?;
+        let norm2 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln2"))?;
+        let norm3 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln3"))?;
+        Ok(Self { masked_self_attention, cross_attention, ffn, norm1, norm2, norm3 })
+    }
+
+    pub fn forward(&self, x: &Tensor, encoder_output: &Tensor) -> Result<Tensor> {
+        let residual = x;
+        let x_attn = self.masked_self_attention.forward(x)?;
+        let x = self.norm1.forward(&(x_attn + residual)?)?;
+
+        let residual = &x;
+        let x_cross = self.cross_attention.forward(&x, encoder_output)?;
+        let x = self.norm2.forward(&(x_cross + residual)?)?;
+
+        let residual = &x;
+        let x_ffn = self.ffn.forward(&x)?;
+        let x = self.norm3.forward(&(x_ffn + residual)?)?;
+        Ok(x)
+    }
+}
+
+// --- Decoder ---
+pub struct Decoder {
+    layers: Vec<DecoderLayer>,
+}
+
+impl Decoder {
+    pub fn new(args: &ModelArgs, vb: VarBuilder) -> Result<Self> {
+        let mut layers = Vec::new();
+        for i in 0..args.no_of_decoder_layers {
+            layers.push(DecoderLayer::new(args, vb.pp(&format!("layer_{}", i)))?);
+        }
+        Ok(Self { layers })
+    }
+
+    pub fn forward(&self, x: &Tensor, encoder_output: &Tensor) -> Result<Tensor> {
+        let mut x_out = x.clone();
+        for layer in &self.layers {
+            x_out = layer.forward(&x_out, encoder_output)?;
+        }
+        Ok(x_out)
+    }
+}
+
+// --- Complete Transformer ---
 pub struct Transformer {
-    config: TransformerConfig,
-    encoder_layers: Vec<EncoderLayer>,
+    embedding: candle_nn::Embedding,
+    encoder: Encoder,
+    decoder: Decoder,
     positional_encoding: PositionalEncoding,
+    output_layer: Linear,
+    args: ModelArgs,
 }
 
 impl Transformer {
-    pub fn new(config: &TransformerConfig) -> Result<Self> {
-        config.validate().map_err(|e| anyhow::anyhow!(e))?;
-        
-        let mut encoder_layers = Vec::new();
-        for _ in 0..config.num_encoder_layers {
-            encoder_layers.push(EncoderLayer::new(
-                config.d_model,
-                config.num_heads,
-                config.d_ff,
-            ));
-        }
-        
-        let positional_encoding = PositionalEncoding::new(config.max_seq_len, config.d_model);
-        
+    pub fn new(args: ModelArgs, vb: VarBuilder) -> Result<Self> {
+        args.validate().map_err(|e| candle_core::Error::Msg(e))?;
+        let device = vb.device();
         Ok(Self {
-            config: config.clone(),
-            encoder_layers,
-            positional_encoding,
+            embedding: candle_nn::embedding(args.vocab_size, args.embeddings_dims, vb.pp("embedding"))?,
+            encoder: Encoder::new(&args, vb.pp("encoder"))?,
+            decoder: Decoder::new(&args, vb.pp("decoder"))?,
+            positional_encoding: PositionalEncoding::new(args.block_size, args.embeddings_dims, device)?,
+            output_layer: linear(args.embeddings_dims, args.vocab_size, vb.pp("output"))?,
+            args,
         })
     }
     
-    /// Forward pass through the transformer
-    pub fn forward(&self, input_embeddings: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        let seq_len = input_embeddings.nrows();
-        
-        // Add positional encoding
-        let pos_encoding = self.positional_encoding.forward(seq_len);
-        let mut x = input_embeddings + pos_encoding;
-        
-        // Pass through encoder layers
-        for layer in &self.encoder_layers {
-            x = layer.forward(&x)?;
-        }
-        
-        Ok(x)
-    }
-    
-    /// Get model configuration
-    pub fn config(&self) -> &TransformerConfig {
-        &self.config
-    }
-}
+    pub fn forward(&self, src: &Tensor, tgt: &Tensor) -> Result<Tensor> {
+        let src_embed = self.embedding.forward(src)?;
+        let tgt_embed = self.embedding.forward(tgt)?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_transformer_creation() -> Result<()> {
-        let config = TransformerConfig::default();
-        let transformer = Transformer::new(&config)?;
-        
-        // Test with dummy input
-        let seq_len = 10;
-        let input = DMatrix::from_element(seq_len, config.d_model, 0.1);
-        
-        let output = transformer.forward(&input)?;
-        assert_eq!(output.nrows(), seq_len);
-        assert_eq!(output.ncols(), config.d_model);
-        
-        Ok(())
-    }
-    
-    #[test]
-    fn test_positional_encoding() {
-        let pe = PositionalEncoding::new(100, 512);
-        let encoding = pe.forward(10);
-        assert_eq!(encoding.nrows(), 10);
-        assert_eq!(encoding.ncols(), 512);
+        let src_pe = self.positional_encoding.forward(src.dim(1)?)?;
+        let tgt_pe = self.positional_encoding.forward(tgt.dim(1)?)?;
+
+        let encoder_output = self.encoder.forward(&(src_embed + src_pe)?)?;
+        let decoder_output = self.decoder.forward(&(tgt_embed + tgt_pe)?, &encoder_output)?;
+        self.output_layer.forward(&decoder_output)
     }
 }
