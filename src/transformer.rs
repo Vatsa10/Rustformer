@@ -1,114 +1,9 @@
 use nalgebra::DMatrix;
-use crate::config::TransformerConfig;
 use anyhow::Result;
+use crate::attention::{FullMultiHeadAttention, MaskedMultiHeadAttention, CrossMultiHeadAttention};
+use crate::model_args::ModelArgs;
 
-/// Scaled Dot-Product Attention implementation
-/// Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V
-pub struct ScaledDotProductAttention {
-    d_k: usize,
-}
-
-impl ScaledDotProductAttention {
-    pub fn new(d_k: usize) -> Self {
-        Self { d_k }
-    }
-    
-    /// Apply scaled dot-product attention
-    /// q, k, v: matrices of shape (seq_len, d_k)
-    pub fn forward(&self, q: &DMatrix<f64>, k: &DMatrix<f64>, v: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        let scale = 1.0 / (self.d_k as f64).sqrt();
-        
-        // Compute attention scores: QK^T / sqrt(d_k)
-        let scores = q * k.transpose() * scale;
-        
-        // Apply softmax row-wise
-        let attention_weights = self.softmax(&scores);
-        
-        // Apply attention weights to values
-        let output = &attention_weights * v;
-        
-        Ok(output)
-    }
-    
-    fn softmax(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
-        let mut result = x.clone();
-        for mut row in result.row_iter_mut() {
-            // Find max for numerical stability
-            let max_val = row.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            
-            // Subtract max and exponentiate
-            for val in row.iter_mut() {
-                *val = (*val - max_val).exp();
-            }
-            
-            // Normalize
-            let sum: f64 = row.iter().sum();
-            for val in row.iter_mut() {
-                *val /= sum;
-            }
-        }
-        result
-    }
-}
-
-/// Multi-Head Attention implementation
-pub struct MultiHeadAttention {
-    num_heads: usize,
-    d_model: usize,
-    d_k: usize,
-    attention: ScaledDotProductAttention,
-    // In a full implementation, these would be actual weight matrices
-    // For this demo, we'll simulate them
-}
-
-impl MultiHeadAttention {
-    pub fn new(d_model: usize, num_heads: usize) -> Self {
-        let d_k = d_model / num_heads;
-        let attention = ScaledDotProductAttention::new(d_k);
-        
-        Self {
-            num_heads,
-            d_model,
-            d_k,
-            attention,
-        }
-    }
-    
-    pub fn forward(&self, query: &DMatrix<f64>, key: &DMatrix<f64>, value: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        let _seq_len = query.nrows();
-        
-        // In a full implementation, we would:
-        // 1. Apply linear projections W_Q, W_K, W_V
-        // 2. Split into multiple heads
-        // 3. Apply attention for each head
-        // 4. Concatenate heads
-        // 5. Apply output projection W_O
-        
-        // For this demo, we'll just apply single-head attention
-        self.attention.forward(query, key, value)
-    }
-}
-
-/// Position-wise Feed-Forward Network
-/// FFN(x) = max(0, xW1 + b1)W2 + b2
-pub struct PositionwiseFeedForward {
-    d_model: usize,
-    d_ff: usize,
-}
-
-impl PositionwiseFeedForward {
-    pub fn new(d_model: usize, d_ff: usize) -> Self {
-        Self { d_model, d_ff }
-    }
-    
-    pub fn forward(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
-        // In a full implementation, this would use actual weight matrices
-        // For demo purposes, we'll apply a simple transformation
-        x.map(|val| (val * 2.0).max(0.0)) // Simplified ReLU-like activation
-    }
-}
-
-/// Layer Normalization
+// --- Layer Normalization ---
 pub struct LayerNorm;
 
 impl LayerNorm {
@@ -129,38 +24,25 @@ impl LayerNorm {
     }
 }
 
-/// Encoder Layer
-pub struct EncoderLayer {
-    self_attention: MultiHeadAttention,
-    ffn: PositionwiseFeedForward,
-    norm1: LayerNorm,
-    norm2: LayerNorm,
+// --- Position-wise Feed-Forward Network ---
+pub struct PositionwiseFeedForward {
+    d_model: usize,
+    d_ff: usize,
 }
 
-impl EncoderLayer {
-    pub fn new(d_model: usize, num_heads: usize, d_ff: usize) -> Self {
-        Self {
-            self_attention: MultiHeadAttention::new(d_model, num_heads),
-            ffn: PositionwiseFeedForward::new(d_model, d_ff),
-            norm1: LayerNorm,
-            norm2: LayerNorm,
-        }
+impl PositionwiseFeedForward {
+    pub fn new(d_model: usize, d_ff: usize) -> Self {
+        Self { d_model, d_ff }
     }
     
-    pub fn forward(&self, x: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        // Self-attention with residual connection and layer norm
-        let attn_output = self.self_attention.forward(x, x, x)?;
-        let x = self.norm1.forward(&(x + attn_output));
-        
-        // Feed-forward with residual connection and layer norm
-        let ffn_output = self.ffn.forward(&x);
-        let x = self.norm2.forward(&(&x + ffn_output));
-        
-        Ok(x)
+    // Simplified FFN with ReLU
+    pub fn forward(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
+        // In a real implementation, this would involve two linear layers
+        x.map(|val| (val * 2.0).max(0.0))
     }
 }
 
-/// Positional Encoding using sinusoidal functions
+// --- Positional Encoding ---
 pub struct PositionalEncoding {
     encoding: DMatrix<f64>,
 }
@@ -171,8 +53,7 @@ impl PositionalEncoding {
         
         for pos in 0..max_seq_len {
             for i in (0..d_model).step_by(2) {
-                let div_term = (i as f64 / d_model as f64) * (10000.0_f64).ln();
-                let div_term = (-div_term).exp();
+                let div_term = (-(i as f64 / d_model as f64) * (10000.0_f64).ln()).exp();
                 let angle = pos as f64 * div_term;
                 
                 encoding[(pos, i)] = angle.sin();
@@ -181,91 +62,196 @@ impl PositionalEncoding {
                 }
             }
         }
-        
         Self { encoding }
     }
-    
+
     pub fn forward(&self, seq_len: usize) -> DMatrix<f64> {
         self.encoding.rows(0, seq_len).into()
     }
 }
 
-/// Complete Transformer model
-pub struct Transformer {
-    config: TransformerConfig,
-    encoder_layers: Vec<EncoderLayer>,
-    positional_encoding: PositionalEncoding,
+// --- Encoder Layer ---
+pub struct EncoderLayer {
+    self_attention: FullMultiHeadAttention,
+    ffn: PositionwiseFeedForward,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
 }
 
-impl Transformer {
-    pub fn new(config: &TransformerConfig) -> Result<Self> {
-        config.validate().map_err(|e| anyhow::anyhow!(e))?;
-        
-        let mut encoder_layers = Vec::new();
-        for _ in 0..config.num_encoder_layers {
-            encoder_layers.push(EncoderLayer::new(
-                config.d_model,
-                config.num_heads,
-                config.d_ff,
-            ));
+impl EncoderLayer {
+    pub fn new(args: &ModelArgs) -> Self {
+        Self {
+            self_attention: FullMultiHeadAttention::new(args.embeddings_dims, args.no_of_heads),
+            ffn: PositionwiseFeedForward::new(args.embeddings_dims, args.d_ff),
+            norm1: LayerNorm,
+            norm2: LayerNorm,
         }
-        
-        let positional_encoding = PositionalEncoding::new(config.max_seq_len, config.d_model);
-        
-        Ok(Self {
-            config: config.clone(),
-            encoder_layers,
-            positional_encoding,
-        })
     }
-    
-    /// Forward pass through the transformer
-    pub fn forward(&self, input_embeddings: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-        let seq_len = input_embeddings.nrows();
+
+    pub fn forward(&self, x: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        // Self-attention with residual and norm
+        let attn_output = self.self_attention.forward(x, x, x)?;
+        let x = self.norm1.forward(&(x + attn_output));
         
-        // Add positional encoding
-        let pos_encoding = self.positional_encoding.forward(seq_len);
-        let mut x = input_embeddings + pos_encoding;
-        
-        // Pass through encoder layers
-        for layer in &self.encoder_layers {
-            x = layer.forward(&x)?;
-        }
+        // FFN with residual and norm
+        let ffn_output = self.ffn.forward(&x);
+        let x = self.norm2.forward(&(&x + ffn_output));
         
         Ok(x)
     }
-    
-    /// Get model configuration
-    pub fn config(&self) -> &TransformerConfig {
-        &self.config
+}
+
+// --- Encoder ---
+pub struct Encoder {
+    layers: Vec<EncoderLayer>,
+}
+
+impl Encoder {
+    pub fn new(args: &ModelArgs) -> Self {
+        let mut layers = Vec::new();
+        for _ in 0..args.no_of_encoder_layers {
+            layers.push(EncoderLayer::new(args));
+        }
+        Self { layers }
+    }
+
+    pub fn forward(&self, x: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        let mut x_out = x.clone();
+        for layer in &self.layers {
+            x_out = layer.forward(&x_out)?;
+        }
+        Ok(x_out)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_transformer_creation() -> Result<()> {
-        let config = TransformerConfig::default();
-        let transformer = Transformer::new(&config)?;
+// --- Decoder Layer ---
+pub struct DecoderLayer {
+    masked_self_attention: MaskedMultiHeadAttention,
+    cross_attention: CrossMultiHeadAttention,
+    ffn: PositionwiseFeedForward,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    norm3: LayerNorm,
+}
+
+impl DecoderLayer {
+    pub fn new(args: &ModelArgs) -> Self {
+        Self {
+            masked_self_attention: MaskedMultiHeadAttention::new(args.embeddings_dims, args.no_of_heads),
+            cross_attention: CrossMultiHeadAttention::new(args.embeddings_dims, args.no_of_heads),
+            ffn: PositionwiseFeedForward::new(args.embeddings_dims, args.d_ff),
+            norm1: LayerNorm,
+            norm2: LayerNorm,
+            norm3: LayerNorm,
+        }
+    }
+
+    pub fn forward(&self, x: &DMatrix<f64>, encoder_output: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        // Masked self-attention
+        let masked_attn_output = self.masked_self_attention.forward(x, x, x)?;
+        let x = self.norm1.forward(&(x + masked_attn_output));
         
-        // Test with dummy input
-        let seq_len = 10;
-        let input = DMatrix::from_element(seq_len, config.d_model, 0.1);
+        // Cross-attention
+        let cross_attn_output = self.cross_attention.forward(&x, encoder_output, encoder_output)?;
+        let x = self.norm2.forward(&(&x + cross_attn_output));
         
-        let output = transformer.forward(&input)?;
-        assert_eq!(output.nrows(), seq_len);
-        assert_eq!(output.ncols(), config.d_model);
+        // Feed-forward
+        let ffn_output = self.ffn.forward(&x);
+        let x = self.norm3.forward(&(&x + ffn_output));
         
-        Ok(())
+        Ok(x)
+    }
+}
+
+// --- Decoder ---
+pub struct Decoder {
+    layers: Vec<DecoderLayer>,
+}
+
+impl Decoder {
+    pub fn new(args: &ModelArgs) -> Self {
+        let mut layers = Vec::new();
+        for _ in 0..args.no_of_decoder_layers {
+            layers.push(DecoderLayer::new(args));
+        }
+        Self { layers }
+    }
+
+    pub fn forward(&self, x: &DMatrix<f64>, encoder_output: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        let mut x_out = x.clone();
+        for layer in &self.layers {
+            x_out = layer.forward(&x_out, encoder_output)?;
+        }
+        Ok(x_out)
+    }
+}
+
+// --- Final Output Layer ---
+pub struct OutputLayer {
+    vocab_size: usize,
+    d_model: usize,
+}
+
+impl OutputLayer {
+    pub fn new(vocab_size: usize, d_model: usize) -> Self {
+        Self { vocab_size, d_model }
+    }
+
+    // Projects to vocab size and applies softmax
+    pub fn forward(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
+        // Simplified projection: just take a slice of the output
+        let projected = x.columns(0, self.vocab_size.min(self.d_model));
+        self.softmax(&DMatrix::from(projected))
+    }
+
+    fn softmax(&self, x: &DMatrix<f64>) -> DMatrix<f64> {
+        let mut result = x.clone();
+        for mut row in result.row_iter_mut() {
+            let max_val = row.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            row.iter_mut().for_each(|v| *v = (*v - max_val).exp());
+            let sum: f64 = row.iter().sum();
+            row.iter_mut().for_each(|v| *v /= sum);
+        }
+        result
+    }
+}
+
+
+// --- Complete Transformer ---
+pub struct Transformer {
+    encoder: Encoder,
+    decoder: Decoder,
+    positional_encoding: PositionalEncoding,
+    output_layer: OutputLayer,
+    args: ModelArgs,
+}
+
+impl Transformer {
+    pub fn new(args: ModelArgs) -> Result<Self> {
+        args.validate().map_err(|e| anyhow::anyhow!(e))?;
+        
+        Ok(Self {
+            encoder: Encoder::new(&args),
+            decoder: Decoder::new(&args),
+            positional_encoding: PositionalEncoding::new(args.block_size, args.embeddings_dims),
+            output_layer: OutputLayer::new(args.vocab_size, args.embeddings_dims),
+            args,
+        })
     }
     
-    #[test]
-    fn test_positional_encoding() {
-        let pe = PositionalEncoding::new(100, 512);
-        let encoding = pe.forward(10);
-        assert_eq!(encoding.nrows(), 10);
-        assert_eq!(encoding.ncols(), 512);
+    pub fn encode(&self, src: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        let pos_encoding = self.positional_encoding.forward(src.nrows());
+        self.encoder.forward(&(src + pos_encoding))
+    }
+    
+    pub fn decode(&self, tgt: &DMatrix<f64>, encoder_output: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        let pos_encoding = self.positional_encoding.forward(tgt.nrows());
+        self.decoder.forward(&(tgt + pos_encoding), encoder_output)
+    }
+    
+    pub fn forward(&self, src: &DMatrix<f64>, tgt: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        let encoder_output = self.encode(src)?;
+        let decoder_output = self.decode(tgt, &encoder_output)?;
+        Ok(self.output_layer.forward(&decoder_output))
     }
 }

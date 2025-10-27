@@ -1,7 +1,5 @@
 use nalgebra::DMatrix;
 use rand::Rng;
-use std::collections::HashMap;
-use anyhow::Result;
 
 /// Top-K sampling with temperature and repetition penalty
 pub struct TopKSampler {
