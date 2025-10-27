@@ -1,0 +1,16 @@
+[package]
+name = "transformer-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+nalgebra = "0.33"
+rand = "0.8"
+chrono = "0.4"
+
+[[bin]]
+name = "transformer"
+path = "src/main.rs"
