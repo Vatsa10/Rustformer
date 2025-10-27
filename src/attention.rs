@@ -4,10 +4,12 @@ use candle_nn::{VarBuilder, Module, linear, Linear};
 // --- Scaled Dot-Product Attention ---
 fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
     let d_k = q.dim(q.dims().len() - 1)? as f64;
-    let mut scores = q.matmul(&k.t()?)? / d_k.sqrt();
-    if let Some(mask) = mask {
-        scores = scores.broadcast_add(mask)?;
-    }
+    let scores = (q.matmul(&k.t()?)? / d_k.sqrt())?;
+    let scores = if let Some(mask) = mask {
+        scores.broadcast_add(mask)?
+    } else {
+        scores
+    };
     let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
     attn_weights.matmul(v)
 }
@@ -42,7 +44,6 @@ impl MultiHeadAttention {
         x.transpose(1, 2)?.reshape((batch_size, seq_len, self.num_heads * self.d_head))
     }
 }
-
 impl Module for MultiHeadAttention {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let q = self.q_proj.forward(x)?;
@@ -81,7 +82,6 @@ impl MaskedMultiHeadAttention {
         Tensor::from_vec(mask, (seq_len, seq_len), device)
     }
 }
-
 impl Module for MaskedMultiHeadAttention {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (_batch_size, seq_len, _d_model) = x.dims3()?;

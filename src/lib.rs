@@ -21,7 +21,6 @@ pub mod complete_transformer;
 pub use config::TransformerConfig;
 pub use transformer::Transformer;
 pub use model_args::ModelArgs;
-pub use optimizer::{AdamW, clip_gradients};
 pub use metrics::MetricsTracker;
 pub use generation::{TopKSampler, BeamSearch, NucleusSampler};
 pub use monitoring::ExperimentMonitor;
