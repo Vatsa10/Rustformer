@@ -1,5 +1,5 @@
 use candle_core::{Tensor, Device, Result};
-use candle_nn::{VarBuilder, Module, LayerNorm, Linear, Dropout, layer_norm, linear};
+use candle_nn::{VarBuilder, Module, LayerNorm, Linear, Dropout, layer_norm, linear, VarMap};
 use crate::attention::{MultiHeadAttention, MaskedMultiHeadAttention, CrossMultiHeadAttention};
 use crate::model_args::ModelArgs;
 
@@ -14,10 +14,6 @@ impl PositionwiseFeedForward {
         let linear1 = linear(d_model, d_ff, vb.pp("ffn_linear1"))?;
         let linear2 = linear(d_ff, d_model, vb.pp("ffn_linear2"))?;
         Ok(Self { linear1, linear2 })
-    }
-
-    pub fn all_vars(&self) -> Vec<candle_core::Var> {
-        self.linear1.vars().into_iter().chain(self.linear2.vars().into_iter()).collect()
     }
 }
 
@@ -71,14 +67,6 @@ impl EncoderLayer {
         let dropout = Dropout::new(args.dropout as f32);
         Ok(Self { self_attention, ffn, norm1, norm2, dropout })
     }
-
-    pub fn all_vars(&self) -> Vec<candle_core::Var> {
-        self.self_attention.all_vars().into_iter()
-            .chain(self.ffn.all_vars().into_iter())
-            .chain(self.norm1.vars().into_iter())
-            .chain(self.norm2.vars().into_iter())
-            .collect()
-    }
 }
 
 impl Module for EncoderLayer {
@@ -106,10 +94,6 @@ impl Encoder {
             layers.push(EncoderLayer::new(args, vb.pp(&format!("layer_{}", i)))?);
         }
         Ok(Self { layers })
-    }
-
-    pub fn all_vars(&self) -> Vec<candle_core::Var> {
-        self.layers.iter().flat_map(|l| l.all_vars()).collect()
     }
 }
 
@@ -146,16 +130,6 @@ impl DecoderLayer {
         Ok(Self { masked_self_attention, cross_attention, ffn, norm1, norm2, norm3, dropout })
     }
 
-    pub fn all_vars(&self) -> Vec<candle_core::Var> {
-        self.masked_self_attention.all_vars().into_iter()
-            .chain(self.cross_attention.all_vars().into_iter())
-            .chain(self.ffn.all_vars().into_iter())
-            .chain(self.norm1.vars().into_iter())
-            .chain(self.norm2.vars().into_iter())
-            .chain(self.norm3.vars().into_iter())
-            .collect()
-    }
-
     pub fn forward(&self, x: &Tensor, encoder_output: &Tensor) -> Result<Tensor> {
         let residual = x;
         let x_attn = self.dropout.forward(&self.masked_self_attention.forward(x)?, true)?;
@@ -186,12 +160,6 @@ impl Decoder {
         Ok(Self { layers })
     }
 
-    pub fn all_vars(&self) -> Vec<candle_core::Var> {
-        self.layers.iter().flat_map(|l| l.all_vars()).collect()
-    }
-}
-
-impl Decoder {
     pub fn forward(&self, x: &Tensor, encoder_output: &Tensor) -> Result<Tensor> {
         let mut x_out = x.clone();
         for layer in &self.layers {
@@ -203,6 +171,7 @@ impl Decoder {
 
 // --- Complete Transformer ---
 pub struct Transformer {
+    varmap: VarMap,
     embedding: candle_nn::Embedding,
     encoder: Encoder,
     decoder: Decoder,
@@ -213,10 +182,12 @@ pub struct Transformer {
 }
 
 impl Transformer {
-    pub fn new(args: ModelArgs, vb: VarBuilder) -> Result<Self> {
+    pub fn new(args: ModelArgs, varmap: &VarMap) -> Result<Self> {
+        let vb = VarBuilder::from_varmap(varmap, candle_core::DType::F32, &Device::Cpu);
         args.validate().map_err(|e| candle_core::Error::Msg(e))?;
         let device = vb.device();
         Ok(Self {
+            varmap: varmap.clone(),
             embedding: candle_nn::embedding(args.vocab_size, args.embeddings_dims, vb.pp("embedding"))?,
             encoder: Encoder::new(&args, vb.pp("encoder"))?,
             decoder: Decoder::new(&args, vb.pp("decoder"))?,
@@ -243,11 +214,6 @@ impl Transformer {
     }
 
     pub fn all_vars(&self) -> Vec<candle_core::Var> {
-        self.encoder.all_vars()
-            .into_iter()
-            .chain(self.decoder.all_vars().into_iter())
-            .chain(self.embedding.vars().into_iter())
-            .chain(self.output_layer.vars().into_iter())
-            .collect()
+        self.varmap.all_vars()
     }
 }

@@ -1,4 +1,4 @@
-use candle_core::{Tensor, Result, DType};
+use candle_core::{Tensor, Result, DType, IndexOp, D};
 
 /// Calculates the cross-entropy loss with label smoothing.
 ///
@@ -18,18 +18,38 @@ pub fn cross_entropy_with_smoothing(
     num_classes: usize,
     smoothing: f32,
 ) -> Result<Tensor> {
-    let confidence = 1.0 - smoothing;
-    let smooth_dist = Tensor::full(smoothing / (num_classes - 1) as f32, (num_classes,), logits.device())?;
-
-    // Create the smoothed target distribution
-    let mut one_hot = Tensor::zeros(labels.shape(), DType::F32, logits.device())?;
-    one_hot = one_hot.scatter_add(&labels.unsqueeze(1)?, &Tensor::ones_like(&labels.to_dtype(DType::F32)?)?, 1)?;
+    let (batch_size, _) = logits.dims2()?;
     
-    let smoothed_targets = one_hot.broadcast_mul(&Tensor::full(confidence, (num_classes,), logits.device())?)?.broadcast_add(&smooth_dist)?;
-
-    // Calculate the loss
+    // Compute log probabilities
     let log_probs = candle_nn::ops::log_softmax(logits, 1)?;
-    let loss = (smoothed_targets * log_probs)?.sum_all()? / (labels.shape().elem_count() as f64);
-
-    Ok(loss.neg()?)
+    
+    if smoothing > 0.0 {
+        // Label smoothing: distribute some probability mass to all classes
+        let confidence = 1.0 - smoothing;
+        let smoothing_value = smoothing / (num_classes - 1) as f32;
+        
+        // Create one-hot encoding for true labels
+        let labels_u32 = labels.to_dtype(DType::U32)?;
+        let mut nll_values = Vec::new();
+        
+        // Gather log probabilities for true labels
+        for i in 0..batch_size {
+            let label_idx = labels_u32.i(i)?.to_scalar::<u32>()? as usize;
+            let log_prob = log_probs.i((i, label_idx))?.to_scalar::<f32>()?;
+            nll_values.push(log_prob);
+        }
+        
+        let nll_loss = Tensor::from_vec(nll_values, (batch_size,), logits.device())?;
+        
+        // Compute smoothed loss
+        let smooth_loss = log_probs.sum(D::Minus1)?;
+        let confidence_tensor = Tensor::new(&[-confidence], logits.device())?;
+        let smoothing_tensor = Tensor::new(&[-smoothing_value], logits.device())?;
+        
+        let loss = (nll_loss.broadcast_mul(&confidence_tensor)? + smooth_loss.broadcast_mul(&smoothing_tensor)?)?;
+        loss.mean(D::Minus1)
+    } else {
+        // Standard cross-entropy without smoothing
+        candle_nn::loss::cross_entropy(logits, labels)
+    }
 }

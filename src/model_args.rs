@@ -124,17 +124,17 @@ impl ModelArgs {
         Ok(())
     }
     
-    /// Get current learning rate based on step (warmup + cosine decay)
+    /// Get current learning rate based on step
+    /// Uses the exact formula from "Attention Is All You Need" paper:
+    /// lr = d_model^(-0.5) × min(step^(-0.5), step × warmup^(-1.5))
     pub fn get_learning_rate(&self, step: usize) -> f64 {
-        if step < self.warmup_steps {
-            // Linear warmup
-            self.max_lr * (step as f64) / (self.warmup_steps as f64)
-        } else {
-            // Cosine decay
-            let progress = (step - self.warmup_steps) as f64 / (self.max_steps - self.warmup_steps) as f64;
-            let progress = progress.min(1.0);
-            let cosine_decay = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
-            self.min_lr + (self.max_lr - self.min_lr) * cosine_decay
-        }
+        let step = (step + 1) as f64; // Add 1 to avoid division by zero
+        let d_model = self.embeddings_dims as f64;
+        let warmup = self.warmup_steps as f64;
+        
+        let scale = d_model.powf(-0.5);
+        let lr_factor = step.powf(-0.5).min(step * warmup.powf(-1.5));
+        
+        scale * lr_factor
     }
 }

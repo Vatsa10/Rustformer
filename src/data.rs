@@ -1,4 +1,4 @@
-use candle_core::{Tensor, Device, Result, DType};
+use candle_core::{Tensor, Device, Result};
 use std::collections::HashMap;
 
 const SOS_TOKEN: &str = "<sos>";
@@ -18,7 +18,7 @@ pub struct TranslationDataset {
 
 impl TranslationDataset {
     /// Creates a tiny simulated dataset for demonstration purposes.
-    pub fn new_dummy(device: &Device) -> Result<Self> {
+    pub fn new_dummy(_device: &Device) -> Result<Self> {
         let pairs = vec![
             ("hello world", "hallo welt"),
             ("good morning", "guten morgen"),

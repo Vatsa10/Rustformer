@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0"
+
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 nalgebra = "0.33"
@@ -13,7 +13,7 @@ chrono = "0.4"
 candle-core = "0.9.1"
 candle-nn = "0.9.1"
 candle-transformers = "0.9.1"
-rust-tokenizers = "0.15.0" 
+rust_tokenizers = "8.1.1"
 anyhow = "1.0"
 
 [[bin]]
