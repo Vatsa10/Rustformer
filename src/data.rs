@@ -1,95 +1,109 @@
-use nalgebra::DMatrix;
+use candle_core::{Tensor, Device, Result, DType};
 use std::collections::HashMap;
 
+const SOS_TOKEN: &str = "<sos>";
+const EOS_TOKEN: &str = "<eos>";
+const PAD_TOKEN: &str = "<pad>";
+
 /// Represents a tokenized dataset with vocabulary
-pub struct Dataset {
-    pub name: String,
-    pub tokenized_texts: Vec<Vec<usize>>,
-    pub vocab: HashMap<String, usize>,
-    pub reverse_vocab: HashMap<usize, String>,
+pub struct TranslationDataset {
+    pub vocab: HashMap<String, u32>,
+    pub reverse_vocab: HashMap<u32, String>,
+    pub pairs: Vec<(Vec<u32>, Vec<u32>)>, // (source, target)
     pub vocab_size: usize,
+    pub sos_token: u32,
+    pub eos_token: u32,
+    pub pad_token: u32,
 }
 
-impl Dataset {
-    /// Create a dummy dataset for demonstration
-    pub fn new_dummy(name: &str, vocab_size: usize, num_samples: usize, max_len: usize) -> Self {
+impl TranslationDataset {
+    /// Creates a tiny simulated dataset for demonstration purposes.
+    pub fn new_dummy(device: &Device) -> Result<Self> {
+        let pairs = vec![
+            ("hello world", "hallo welt"),
+            ("good morning", "guten morgen"),
+            ("how are you", "wie geht es ihnen"),
+            ("thank you", "danke schön"),
+        ];
+
         let mut vocab = HashMap::new();
-        let mut reverse_vocab = HashMap::new();
-        for i in 0..vocab_size {
-            let token = format!("<token_{}>", i);
-            vocab.insert(token.clone(), i);
-            reverse_vocab.insert(i, token);
+        vocab.insert(PAD_TOKEN.to_string(), 0);
+        vocab.insert(SOS_TOKEN.to_string(), 1);
+        vocab.insert(EOS_TOKEN.to_string(), 2);
+
+        for (src, tgt) in &pairs {
+            for word in src.split_whitespace() {
+                if !vocab.contains_key(word) {
+                    vocab.insert(word.to_string(), vocab.len() as u32);
+                }
+            }
+            for word in tgt.split_whitespace() {
+                if !vocab.contains_key(word) {
+                    vocab.insert(word.to_string(), vocab.len() as u32);
+                }
+            }
         }
 
-        let mut tokenized_texts = Vec::new();
-        for i in 0..num_samples {
-            let len = (i % max_len) + 1;
-            tokenized_texts.push((0..len).map(|j| (i + j) % vocab_size).collect());
-        }
+        let reverse_vocab = vocab.iter().map(|(k, &v)| (v, k.clone())).collect();
+        let vocab_size = vocab.len();
+        let sos_token = vocab[SOS_TOKEN];
+        let eos_token = vocab[EOS_TOKEN];
+        let pad_token = vocab[PAD_TOKEN];
 
-        Self {
-            name: name.to_string(),
-            tokenized_texts,
+        let tokenized_pairs = pairs
+            .iter()
+            .map(|(src, tgt)| {
+                let src_tokens = src.split_whitespace().map(|w| vocab[w]).collect();
+                let tgt_tokens = tgt.split_whitespace().map(|w| vocab[w]).collect();
+                (src_tokens, tgt_tokens)
+            })
+            .collect();
+
+        Ok(Self {
             vocab,
             reverse_vocab,
+            pairs: tokenized_pairs,
             vocab_size,
-        }
-    }
-}
-
-/// Tokenizer for converting text to token IDs
-pub struct Tokenizer {
-    vocab: HashMap<String, usize>,
-}
-
-impl Tokenizer {
-    pub fn new(vocab: HashMap<String, usize>) -> Self {
-        Self { vocab }
+            sos_token,
+            eos_token,
+            pad_token,
+        })
     }
 
-    /// Tokenize a sentence (simplified)
-    pub fn tokenize(&self, text: &str) -> Vec<usize> {
-        text.split_whitespace()
-            .map(|word| self.vocab.get(word).copied().unwrap_or(0)) // 0 for <unk>
-            .collect()
-    }
-}
+    /// Creates a batch of padded tensors for training.
+    pub fn get_batch(&self, indices: &[usize], block_size: usize, device: &Device) -> Result<(Tensor, Tensor, Tensor)> {
+        let mut src_batch = Vec::new();
+        let mut tgt_batch = Vec::new();
+        let mut label_batch = Vec::new();
 
-/// Data loader for creating batches from a dataset
-pub struct DataLoader<'a> {
-    dataset: &'a Dataset,
-    batch_size: usize,
-    cursor: usize,
-}
+        for &i in indices {
+            let (src, tgt) = &self.pairs[i];
 
-impl<'a> DataLoader<'a> {
-    pub fn new(dataset: &'a Dataset, batch_size: usize) -> Self {
-        Self {
-            dataset,
-            batch_size,
-            cursor: 0,
-        }
-    }
-}
+            // Prepare source tensor
+            let mut src_padded = vec![self.pad_token; block_size];
+            let src_len = src.len().min(block_size);
+            src_padded[..src_len].copy_from_slice(&src[..src_len]);
+            src_batch.extend_from_slice(&src_padded);
 
-/// Iterator for the data loader
-impl<'a> Iterator for DataLoader<'a> {
-    type Item = (DMatrix<f64>, DMatrix<f64>); // (source_batch, target_batch)
+            // Prepare target tensor (decoder input)
+            let mut tgt_padded = vec![self.pad_token; block_size];
+            tgt_padded[0] = self.sos_token;
+            let tgt_len = tgt.len().min(block_size - 1);
+            tgt_padded[1..=tgt_len].copy_from_slice(&tgt[..tgt_len]);
+            tgt_batch.extend_from_slice(&tgt_padded);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.cursor >= self.dataset.tokenized_texts.len() {
-            return None;
+            // Prepare label tensor (decoder output)
+            let mut label_padded = vec![self.pad_token; block_size];
+            let label_len = tgt.len().min(block_size - 1);
+            label_padded[..label_len].copy_from_slice(&tgt[..label_len]);
+            label_padded[label_len] = self.eos_token;
+            label_batch.extend_from_slice(&label_padded);
         }
 
-        let end = (self.cursor + self.batch_size).min(self.dataset.tokenized_texts.len());
-        let batch_texts = &self.dataset.tokenized_texts[self.cursor..end];
-        self.cursor = end;
+        let src_tensor = Tensor::from_vec(src_batch, (indices.len(), block_size), device)?;
+        let tgt_tensor = Tensor::from_vec(tgt_batch, (indices.len(), block_size), device)?;
+        let label_tensor = Tensor::from_vec(label_batch, (indices.len(), block_size), device)?;
 
-        // Dummy conversion to DMatrix for demonstration
-        // In a real scenario, this would involve padding and embedding lookups
-        let src_matrix = DMatrix::from_element(batch_texts.len(), 512, 0.1);
-        let tgt_matrix = DMatrix::from_element(batch_texts.len(), 512, 0.1);
-
-        Some((src_matrix, tgt_matrix))
+        Ok((src_tensor, tgt_tensor, label_tensor))
     }
 }

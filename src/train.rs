@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use candle_core::{Device, Tensor};
-use candle_nn::{VarBuilder, Optimizer, loss, VarMap, optim::{AdamW, ParamsAdamW}};
+use candle_core::Device;
+use candle_nn::{VarBuilder, Optimizer, AdamW};
 
 use crate::{
-    ModelArgs, Transformer, MetricsTracker, ExperimentMonitor
+    ModelArgs, Transformer, MetricsTracker, ExperimentMonitor, loss, data
 };
 
 /// Main training function
@@ -12,40 +12,39 @@ pub fn train(args: &ModelArgs) -> Result<()> {
     println!("Setting up training environment...");
 
     let device = Device::Cpu;
-    let mut varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+
+    // Initialize dataset and update model args
+    let dataset = data::TranslationDataset::new_dummy(&device)?;
+    let mut args = args.clone();
+    args.vocab_size = dataset.vocab_size;
+
+    let vb = VarBuilder::zeros(candle_core::DType::F32, &device);
 
     // Initialize model
     let model = Transformer::new(args.clone(), vb)?;
-    println!("Transformer model initialized.");
+    println!("Transformer model initialized with vocab size: {}", args.vocab_size);
 
     // Optimizer
-    let config = ParamsAdamW {
-        lr: args.max_lr,
-        beta1: args.beta1,
-        beta2: args.beta2,
-        eps: args.epsilon,
-        weight_decay: args.weight_decay,
-    };
-    let mut optimizer = AdamW::new(varmap.all_vars(), config)?;
+    let params = model.all_vars();
+    let mut optimizer = AdamW::new(params, args.max_lr)?;
     println!("AdamW optimizer configured.");
 
     // Metrics and monitoring
     let mut metrics = MetricsTracker::new(10000);
     let mut monitor = ExperimentMonitor::new("transformer-training", "demo-run");
-    monitor.log_config(args);
+    monitor.log_config(&args);
     println!("Metrics and monitoring are set up.");
 
     println!("\nStarting training...\n");
+    let batch_indices: Vec<usize> = (0..args.batch_size.min(dataset.pairs.len())).collect();
+
     for step in 0..100 { // Simulate for 100 steps
-        // Dummy data (U32 token IDs)
-        let src = Tensor::ones((args.batch_size, args.block_size), candle_core::DType::U32, &device)?;
-        let tgt = Tensor::ones((args.batch_size, args.block_size), candle_core::DType::U32, &device)?;
-        let labels = Tensor::ones((args.batch_size, args.block_size), candle_core::DType::U32, &device)?;
+        // Get a batch of data
+        let (src, tgt, labels) = dataset.get_batch(&batch_indices, args.block_size, &device)?;
 
         // Forward pass
         let logits = model.forward(&src, &tgt)?;
-        let loss = loss::cross_entropy(&logits.flatten_to(1)?, &labels.flatten_to(1)?)?;
+        let loss = loss::cross_entropy_with_smoothing(&logits.flatten_to(1)?, &labels.flatten_to(1)?, args.vocab_size, args.label_smoothing as f32)?;
 
         // Backward pass and optimization
         optimizer.backward_step(&loss)?;

@@ -1,5 +1,5 @@
 use candle_core::{Tensor, Device, Result};
-use candle_nn::{VarBuilder, Module, LayerNorm, Linear, layer_norm, linear};
+use candle_nn::{VarBuilder, Module, LayerNorm, Linear, Dropout, layer_norm, linear};
 use crate::attention::{MultiHeadAttention, MaskedMultiHeadAttention, CrossMultiHeadAttention};
 use crate::model_args::ModelArgs;
 
@@ -15,7 +15,12 @@ impl PositionwiseFeedForward {
         let linear2 = linear(d_ff, d_model, vb.pp("ffn_linear2"))?;
         Ok(Self { linear1, linear2 })
     }
+
+    pub fn all_vars(&self) -> Vec<candle_core::Var> {
+        self.linear1.vars().into_iter().chain(self.linear2.vars().into_iter()).collect()
+    }
 }
+
 impl Module for PositionwiseFeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.linear2.forward(&self.linear1.forward(x)?.relu()?)
@@ -54,6 +59,7 @@ pub struct EncoderLayer {
     ffn: PositionwiseFeedForward,
     norm1: LayerNorm,
     norm2: LayerNorm,
+    dropout: Dropout,
 }
 
 impl EncoderLayer {
@@ -62,17 +68,27 @@ impl EncoderLayer {
         let ffn = PositionwiseFeedForward::new(args.embeddings_dims, args.d_ff, vb.pp("ffn"))?;
         let norm1 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln1"))?;
         let norm2 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln2"))?;
-        Ok(Self { self_attention, ffn, norm1, norm2 })
+        let dropout = Dropout::new(args.dropout as f32);
+        Ok(Self { self_attention, ffn, norm1, norm2, dropout })
+    }
+
+    pub fn all_vars(&self) -> Vec<candle_core::Var> {
+        self.self_attention.all_vars().into_iter()
+            .chain(self.ffn.all_vars().into_iter())
+            .chain(self.norm1.vars().into_iter())
+            .chain(self.norm2.vars().into_iter())
+            .collect()
     }
 }
+
 impl Module for EncoderLayer {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x;
-        let x_attn = self.self_attention.forward(x)?;
+        let x_attn = self.dropout.forward(&self.self_attention.forward(x)?, true)?;
         let x = self.norm1.forward(&(x_attn + residual)?)?;
 
         let residual = &x;
-        let x_ffn = self.ffn.forward(&x)?;
+        let x_ffn = self.dropout.forward(&self.ffn.forward(&x)?, true)?;
         let x = self.norm2.forward(&(x_ffn + residual)?)?;
         Ok(x)
     }
@@ -90,6 +106,10 @@ impl Encoder {
             layers.push(EncoderLayer::new(args, vb.pp(&format!("layer_{}", i)))?);
         }
         Ok(Self { layers })
+    }
+
+    pub fn all_vars(&self) -> Vec<candle_core::Var> {
+        self.layers.iter().flat_map(|l| l.all_vars()).collect()
     }
 }
 
@@ -111,6 +131,7 @@ pub struct DecoderLayer {
     norm1: LayerNorm,
     norm2: LayerNorm,
     norm3: LayerNorm,
+    dropout: Dropout,
 }
 
 impl DecoderLayer {
@@ -121,20 +142,31 @@ impl DecoderLayer {
         let norm1 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln1"))?;
         let norm2 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln2"))?;
         let norm3 = layer_norm(args.embeddings_dims, 1e-6, vb.pp("ln3"))?;
-        Ok(Self { masked_self_attention, cross_attention, ffn, norm1, norm2, norm3 })
+        let dropout = Dropout::new(args.dropout as f32);
+        Ok(Self { masked_self_attention, cross_attention, ffn, norm1, norm2, norm3, dropout })
+    }
+
+    pub fn all_vars(&self) -> Vec<candle_core::Var> {
+        self.masked_self_attention.all_vars().into_iter()
+            .chain(self.cross_attention.all_vars().into_iter())
+            .chain(self.ffn.all_vars().into_iter())
+            .chain(self.norm1.vars().into_iter())
+            .chain(self.norm2.vars().into_iter())
+            .chain(self.norm3.vars().into_iter())
+            .collect()
     }
 
     pub fn forward(&self, x: &Tensor, encoder_output: &Tensor) -> Result<Tensor> {
         let residual = x;
-        let x_attn = self.masked_self_attention.forward(x)?;
+        let x_attn = self.dropout.forward(&self.masked_self_attention.forward(x)?, true)?;
         let x = self.norm1.forward(&(x_attn + residual)?)?;
 
         let residual = &x;
-        let x_cross = self.cross_attention.forward(&x, encoder_output)?;
+        let x_cross = self.dropout.forward(&self.cross_attention.forward(&x, encoder_output)?, true)?;
         let x = self.norm2.forward(&(x_cross + residual)?)?;
 
         let residual = &x;
-        let x_ffn = self.ffn.forward(&x)?;
+        let x_ffn = self.dropout.forward(&self.ffn.forward(&x)?, true)?;
         let x = self.norm3.forward(&(x_ffn + residual)?)?;
         Ok(x)
     }
@@ -154,6 +186,12 @@ impl Decoder {
         Ok(Self { layers })
     }
 
+    pub fn all_vars(&self) -> Vec<candle_core::Var> {
+        self.layers.iter().flat_map(|l| l.all_vars()).collect()
+    }
+}
+
+impl Decoder {
     pub fn forward(&self, x: &Tensor, encoder_output: &Tensor) -> Result<Tensor> {
         let mut x_out = x.clone();
         for layer in &self.layers {
@@ -170,6 +208,7 @@ pub struct Transformer {
     decoder: Decoder,
     positional_encoding: PositionalEncoding,
     output_layer: Linear,
+    dropout: Dropout,
     args: ModelArgs,
 }
 
@@ -183,6 +222,7 @@ impl Transformer {
             decoder: Decoder::new(&args, vb.pp("decoder"))?,
             positional_encoding: PositionalEncoding::new(args.block_size, args.embeddings_dims, device)?,
             output_layer: linear(args.embeddings_dims, args.vocab_size, vb.pp("output"))?,
+            dropout: Dropout::new(args.dropout as f32),
             args,
         })
     }
@@ -194,8 +234,20 @@ impl Transformer {
         let src_pe = self.positional_encoding.forward(src.dim(1)?)?;
         let tgt_pe = self.positional_encoding.forward(tgt.dim(1)?)?;
 
-        let encoder_output = self.encoder.forward(&(src_embed + src_pe)?)?;
-        let decoder_output = self.decoder.forward(&(tgt_embed + tgt_pe)?, &encoder_output)?;
+        let src_with_pe = self.dropout.forward(&(src_embed + src_pe)?, true)?;
+        let tgt_with_pe = self.dropout.forward(&(tgt_embed + tgt_pe)?, true)?;
+
+        let encoder_output = self.encoder.forward(&src_with_pe)?;
+        let decoder_output = self.decoder.forward(&tgt_with_pe, &encoder_output)?;
         self.output_layer.forward(&decoder_output)
+    }
+
+    pub fn all_vars(&self) -> Vec<candle_core::Var> {
+        self.encoder.all_vars()
+            .into_iter()
+            .chain(self.decoder.all_vars().into_iter())
+            .chain(self.embedding.vars().into_iter())
+            .chain(self.output_layer.vars().into_iter())
+            .collect()
     }
 }

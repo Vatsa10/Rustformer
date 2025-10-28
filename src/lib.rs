@@ -13,6 +13,7 @@ pub mod monitoring;
 pub mod attention;
 pub mod data;
 pub mod train;
+pub mod loss;
 
 // This file is intentionally left blank as its content has been merged into transformer.rs
 pub mod complete_transformer;
